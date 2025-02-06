@@ -197,7 +197,7 @@ def main():
 
     # 3) Announce start time
     start_time = datetime.datetime.now()
-    log(f"Starting download at {start_time}...")
+    log(f"Starting download at {start_time.strftime('%Y-%m-%d %H:%M:%S')}...")
 
     # 4) Download each item
     session = requests.Session()
@@ -220,7 +220,7 @@ def main():
         dest_path = os.path.join(target_subdir, filename)
 
         items_left = total_to_download - i
-        log(f"\n[{i}/{total_to_download}] Downloading: {filename}  (remaining: {items_left})")
+        log(f"\n{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{i}/{total_to_download}] Downloading: {filename}  (remaining: {items_left})")
         downloads_attempted += 1
 
         success = download_with_progress(session, url, dest_path)
@@ -232,7 +232,7 @@ def main():
     elapsed = end_time - start_time
 
     log("\n===== DOWNLOAD SUMMARY =====")
-    log(f"End time: {end_time}")
+    log(f"End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"Total time elapsed: {elapsed}")
     log(f"Downloads attempted: {downloads_attempted}")
     log(f"Downloads successful: {downloads_successful}")
