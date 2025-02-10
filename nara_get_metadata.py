@@ -168,7 +168,7 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d")
 
     # Save page 1 JSON
-    page1_filename = f"{parent_naid}-pg{page}of{total_pages}-{now_str}.json"
+    page1_filename = f"{parent_naid}-metadata-pg{page}of{total_pages}-{now_str}.json"
     page1_path = os.path.join(args.outdir, page1_filename)
     with open(page1_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -237,7 +237,7 @@ def main():
     # -------------------------------------------------------------------------
     # Step 4: Write these extracted fields to CSV
     # -------------------------------------------------------------------------
-    csv_filename = f"{parent_naid}-records-{now_str}.csv"
+    csv_filename = f"{parent_naid}-binaries-{now_str}.csv"
     csv_path = os.path.join(args.outdir, csv_filename)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as csvfile:
