@@ -194,7 +194,7 @@ def main():
             break
 
         # Save the JSON
-        filename = f"{parent_naid}-pg{pg}of{total_pages}-{now_str}.json"
+        filename = f"{parent_naid}-metadata-pg{pg}of{total_pages}-{now_str}.json"
         filepath = os.path.join(args.outdir, filename)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data_pg, f, indent=2)
