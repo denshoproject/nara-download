@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 
 """
-nara_download_by_parentNaId.py
+nara_get_metadata.py
 
-1. Fetches paginated results from /records/parentNaId/{parentNaId} (using body.hits.total.value).
-2. Saves each page's JSON to "[parentNaId]-pg[page]of[totalPages]-YYYYMMdd.json".
+1. Fetches paginated results from /records/search (using body.hits.total.value).
+   - Accepts one or more NAIDs via --naid, e.g. --naid 720246 123456
+     OR via a file specified by --batch, containing one NAID per line.
+   - Passes them as repeated naId=... query parameters to the /records/search endpoint
+     (actually uses a comma-separated string of NAIDs).
+2. Saves each page's JSON to "searchNaid-metadata-pg[page]of[totalPages]-YYYYMMdd.json".
 3. Extracts each record's naId, title, and for each item in record.digitalObjects,
    includes a line with objectUrl, objectFileSize.
 
 Writes these fields to CSV:
   naId,title,objectUrl,objectFileSize
 
-Requires:
+Requirements:
   - NARA_API_KEY in the environment (e.g. export NARA_API_KEY=...).
-  - The endpoint must return JSON of the form:
+  - The /records/search endpoint must return JSON of the form:
       {
         "body": {
           "hits": {
@@ -61,7 +65,6 @@ def log_error(message):
     """
     Print error messages with a consistent prefix and timestamp to stderr.
     """
-    import sys
     stamp = datetime.datetime.now().isoformat()
     print(f"[ERROR] [{stamp}] {message}", file=sys.stderr)
 
@@ -83,28 +86,42 @@ def safe_json_parse(response):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download full pages from /records/parentNaId/{parentNaId} and extract record data."
+        description=(
+            "Download full pages from /records/search, specifying one or more "
+            "naId values. You can pass them via --naid or via a text file with "
+            "--batch (one NAID per line)."
+        )
     )
     parser.add_argument(
-        "--parent-naid",
-        required=True,
-        help="The parentNaId to query, e.g. 720246"
+        "--naid",
+        nargs="+",
+        help=(
+            "One or more NAIDs (e.g. --naid 720246 123456). "
+            "Ignored if --batch is provided."
+        )
+    )
+    parser.add_argument(
+        "--batch",
+        help=(
+            "Path to a text file containing a list of NAIDs, "
+            "one per line. Overrides --naid."
+        )
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=100,
-        help="Number of records per page (limit)"
+        help="Number of records per page (limit)."
     )
     parser.add_argument(
         "--outdir",
         default="results",
-        help="Directory where JSON pages and CSV output will be saved"
+        help="Directory where JSON pages and CSV output will be saved."
     )
     parser.add_argument(
         "--http-debug",
         action="store_true",
-        help="Enable verbose HTTP request/response logging"
+        help="Enable verbose HTTP request/response logging."
     )
     args = parser.parse_args()
 
@@ -136,22 +153,55 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     # -------------------------------------------------------------------------
-    # Step 1: Get first page, read total from body.hits.total.value
+    # Determine NAIDs to query
+    #   1) If --batch provided, read from file
+    #   2) Else, use --naid
+    #   3) If neither, error
     # -------------------------------------------------------------------------
-    parent_naid = args.parent_naid
+    naid_list = []
+    if args.batch:
+        # read lines from text file, one per line
+        if not os.path.isfile(args.batch):
+            log_error(f"Batch file does not exist: {args.batch}")
+            sys.exit(1)
+        with open(args.batch, "r", encoding="utf-8") as fbatch:
+            for line in fbatch:
+                line = line.strip()
+                if line:
+                    naid_list.append(line)
+        print(f"[*] Loaded {len(naid_list)} NAIDs from batch file: {args.batch}")
+    else:
+        # fallback to --naid
+        if not args.naid:
+            parser.error("You must provide either --naid or --batch.")
+        naid_list = args.naid
+
+    # We'll pass the entire list as a single comma-separated value to 'naId' param.
+    naid_param = ",".join(naid_list)
+    print(f"[*] Using naId(s): {naid_list}")
+
     limit = args.limit
     page = 1
 
-    print(f"[*] Fetching first page for parentNaId={parent_naid}, limit={limit}")
-    url = f"{API_BASE_URL}/records/parentNaId/{parent_naid}"
-    params = {"page": page, "limit": limit}
+    # -------------------------------------------------------------------------
+    # Step 1: Retrieve first page, to get totalRecords from body.hits.total.value
+    # -------------------------------------------------------------------------
+    # Build the query parameters for page=1
+    params_first_page = [
+        ("naId", naid_param),
+        ("limit", limit),
+        ("page", page),
+    ]
+
+    print(f"[*] Fetching first page, limit={limit}")
+    search_url = f"{API_BASE_URL}/records/search"
 
     try:
-        resp = session.get(url, params=params)
+        resp = session.get(search_url, params=params_first_page)
         resp.raise_for_status()
         data = safe_json_parse(resp)
     except Exception as e:
-        log_error(f"Failed to retrieve page=1 for parentNaId={parent_naid}: {e}")
+        log_error(f"Failed to retrieve page=1 for naId(s)={naid_list}: {e}")
         sys.exit(1)
 
     body = data.get("body", {})
@@ -168,7 +218,7 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d")
 
     # Save page 1 JSON
-    page1_filename = f"{parent_naid}-metadata-pg{page}of{total_pages}-{now_str}.json"
+    page1_filename = f"searchNaid-metadata-pg{page}of{total_pages}-{now_str}.json"
     page1_path = os.path.join(args.outdir, page1_filename)
     with open(page1_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -185,16 +235,23 @@ def main():
     for pg in range(2, total_pages + 1):
         print(f"[*] Fetching page={pg} of {total_pages} ...")
 
+        # Build new param list for this page
+        params_this_page = [
+            ("naId", naid_param),
+            ("limit", limit),
+            ("page", pg),
+        ]
+
         try:
-            resp_pg = session.get(url, params={"page": pg, "limit": limit})
+            resp_pg = session.get(search_url, params=params_this_page)
             resp_pg.raise_for_status()
             data_pg = safe_json_parse(resp_pg)
         except Exception as e:
-            log_error(f"Failed to retrieve page={pg} for parentNaId={parent_naid}: {e}")
+            log_error(f"Failed to retrieve page={pg} for naId(s)={naid_list}: {e}")
             break
 
         # Save the JSON
-        filename = f"{parent_naid}-metadata-pg{pg}of{total_pages}-{now_str}.json"
+        filename = f"searchNaid-metadata-pg{pg}of{total_pages}-{now_str}.json"
         filepath = os.path.join(args.outdir, filename)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data_pg, f, indent=2)
@@ -208,27 +265,23 @@ def main():
     print(f"[+] Retrieved total of {len(all_hits)} hits across {total_pages} pages.\n")
 
     # -------------------------------------------------------------------------
-    # Step 3: For each hit, extract "naId", "title", and each digitalObjects item
-    #         "objectUrl", "objectFileSize"
+    # Step 3: For each hit, extract "naId", "title", and digitalObjects:
+    #   "objectUrl", "objectFileSize"
     # -------------------------------------------------------------------------
-    # We'll store rows like:
-    #   naId, title, objectUrl, objectFileSize
     extracted_rows = []
 
     for hit in all_hits:
-        src = hit.get("_source", {})
-        record = src.get("record", {})
+        _source = hit.get("_source", {})
+        record = _source.get("record", {})
 
-        naId = record.get("naId")
+        rec_naid = record.get("naId")
         title = record.get("title", "")
 
-        # digitalObjects is presumably an array. If missing or empty -> no rows
         digital_objects = record.get("digitalObjects", [])
         for dobj in digital_objects:
             row = {
-                "naId": naId,
+                "naId": rec_naid,
                 "title": title,
-                # The script specifically wants to extract:
                 "objectUrl": dobj.get("objectUrl"),
                 "objectFileSize": dobj.get("objectFileSize")
             }
@@ -237,15 +290,14 @@ def main():
     # -------------------------------------------------------------------------
     # Step 4: Write these extracted fields to CSV
     # -------------------------------------------------------------------------
-    csv_filename = f"{parent_naid}-binaries-{now_str}.csv"
+    csv_filename = f"searchNaid-binaries-{now_str}.csv"
     csv_path = os.path.join(args.outdir, csv_filename)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as csvfile:
         fieldnames = ["naId", "title", "objectUrl", "objectFileSize"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        for row in extracted_rows:
-            writer.writerow(row)
+        writer.writerows(extracted_rows)
 
     print(f"[+] Wrote {len(extracted_rows)} lines to CSV -> {csv_path}")
     print("[DONE]")
@@ -253,4 +305,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
