@@ -214,7 +214,7 @@ def main():
         filename = os.path.basename(urlsplit(url).path)
         if not filename:
             filename = f"file_{i}"
-        filename = f"{item["naId"]}_{filename}"
+        filename = f"{item['naId']}_{filename}"
         dest_path = os.path.join(target_subdir, filename)
 
         items_left = total_to_download - i
