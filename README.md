@@ -23,184 +23,129 @@ This repository contains Python 3 scripts for interacting with the [NARA NextGen
 - A valid **NARA_API_KEY** (placed in your environment as `NARA_API_KEY=...`).  
   - See NARA’s [API help page](https://www.archives.gov/research/catalog/help/api) and [API Docs](https://catalog.archives.gov/api/v2/api-docs/) for how to obtain an API key.
 
-Make sure your environment is set up properly before running the scripts:
+Before running the scripts, confirm your environment:
 ```bash
 export NARA_API_KEY="YOUR_VALID_API_KEY"
-```
 
----
+Scripts Overview
+1. nara_get_metadata.py
 
-## Scripts Overview
+This script queries the NARA NextGen Catalog with two approaches to retrieve child digital objects for each NAID, one NAID at a time:
 
-### 1. `nara_get_metadata.py`
+    Primary:
+    Calls /records/search with ?naId_is=<NAID> to retrieve pages.
+        If digital objects are found in the returned data (digitalObjects arrays), it saves JSON pages and creates a CSV.
+    Fallback:
+    If the first approach returns no digital objects, it discards those results and calls /records/parentNaId/<NAID> with ?page=...&limit=....
+        If that call also has zero digital objects, it prints a warning to stdout that no child digital objects exist for the NAID, and produces no CSV or JSON output for it.
 
-This script queries the **NARA NextGen Catalog `/records/search` endpoint** with `?naId_is=<NAID>`, making **one call per NAID**. It accepts NAIDs from either the command line (`--naid 720246 123456`) or from a text file (`--batch my_naids.txt`) containing one NAID per line.  
+Behavior:
 
-**What It Does**:
+    For each NAID:
+        Attempt GET /records/search?naId_is=<NAID> in a paginated manner.
+        If that yields zero objects, try GET /records/parentNaId/<NAID> in the same paginated style.
+        If both yield zero, prints a warning that no digital objects are returned, and does not produce files.
+        Otherwise, saves JSON pages and produces <NAID>-binaries-YYYYMMdd.csv in an outdir/NAID/ subdirectory.
 
-1. **Iterates** over each NAID specified.  
-2. **Fetches** the total number of records (`body.hits.total.value`), then retrieves JSON pages for that NAID (`page=1..N`), saving them to:
-   ```
-   outdir/
-     └─ <NAID>/
-        ├─ <NAID>-metadata-pg1ofN-YYYYMMdd.json
-        ├─ <NAID>-metadata-pg2ofN-YYYYMMdd.json
-        ...  
-   ```
-3. **Extracts** each record’s `naId`, `title`, and any `digitalObjects` (with `objectUrl`, `objectFileSize`) into a CSV named:
-   ```
-   <NAID>-binaries-YYYYMMdd.csv
-   ```
-   inside that same `<NAID>/` subdirectory.
+Usage:
 
-**Usage**:
-```bash
 python nara_get_metadata.py \
   --naid 720246 123456 \
   --limit 50 \
-  --outdir metadata_results
-```
-or using a batch file:
-```bash
+  --outdir results
+
+or via a batch file:
+
 python nara_get_metadata.py \
   --batch naids.txt \
   --limit 50 \
-  --outdir metadata_results
-```
+  --outdir results
 
-**Key Arguments**:
-- `--naid`: One or more NAIDs to query; ignored if `--batch` is set.  
-- `--batch`: Path to a text file listing NAIDs (one per line).  
-- `--limit`: Number of records per page (default=100).  
-- `--outdir`: Directory in which each NAID gets its own subdirectory for JSON pages and CSV output (default=`results`).  
-- `--http-debug`: Enables verbose HTTP logs for debugging.
+    --naid: One or more NAIDs on the command line. Ignored if --batch is used.
+    --batch: A text file with one NAID per line.
+    --limit: Number of child records to fetch per page (default=100).
+    --outdir: Directory in which each NAID subdirectory is created.
+    --http-debug: Logs verbose HTTP request and response details.
 
-### 2. `nara_download_binaries.py`
+Output Layout:
 
-Reads a CSV (typically produced by `nara_get_metadata.py`) with columns:
-```
+results/
+  ├─ 720246/
+  │   ├─ 720246-metadata-pg1of4-YYYYMMdd.json
+  │   ├─ 720246-metadata-pg2of4-YYYYMMdd.json
+  │   └─ 720246-binaries-YYYYMMdd.csv
+  └─ 123456/
+      ├─ 123456-parentNaId-pg1of2-YYYYMMdd.json
+      └─ 123456-binaries-YYYYMMdd.csv
+
+(The naming varies slightly depending on whether the fallback approach was used.)
+2. nara_download_binaries.py
+
+Reads a CSV (from nara_get_metadata.py) with columns:
+
 naId,title,objectUrl,objectFileSize
-```
+
 It:
 
-1. **Reports** the total number of binaries and the sum of their file sizes in a **human-readable** format.  
-2. Creates a **date-based** subdirectory under a specified or default path (`./downloads`), for example:
-   ```
-   20250203-1
-   ```
-   If rerun on the same date, increments the suffix (`20250203-2`, etc.).  
-3. **Logs** the start time, then for **each** row in the CSV:
-   - Downloads the file from `objectUrl`, showing a **progress bar**.  
-   - **Optionally** waits a back-off time (in milliseconds) between downloads (via `--backoff`).  
-4. **Logs** the end time, total time elapsed, number of downloads attempted/successful.  
-5. **Prints** any failures by **CSV line number** and URL, so you can re-attempt those downloads if needed.
+    Reports total number of items and cumulative file size (human-readable).
+    Creates a date-based subdirectory (e.g., ./downloads/20250217-1) to store downloaded files.
+    Logs start time, attempts a progress bar for each file, optionally waiting a back-off time (--backoff <ms>) after each download.
+    Logs end time, total downloads attempted, how many succeeded, and prints the CSV line numbers of any failed downloads.
 
-**Usage**:
-```bash
+Usage:
+
 python nara_download_binaries.py \
-  --csv my_metadata/720246-binaries-20250101.csv \
+  --csv results/720246/720246-binaries-YYYYMMdd.csv \
   --download_path ./downloads \
   --backoff 500
-```
 
-**Key Arguments**:
-- `--csv`: Path to the CSV with `objectUrl` columns to download.  
-- `--download_path`: Base directory for date-based subfolders (default=`./downloads`).  
-- `--test`: Prints stats but does **not** download anything.  
-- `--backoff <ms>`: Optional integer specifying how many milliseconds to wait after each file completes. (Default=0).  
+    --csv: Path to the CSV.
+    --test: If present, no downloads are made; only stats are shown.
+    --download_path: Base directory for date-based subfolders (default=./downloads).
+    --backoff: Integer milliseconds to pause after each download (default=0).
 
-**What’s New**:  
-- **Back-off** time support (`--backoff`).  
-- **Line Number Failures**: If a file fails to download, the script logs a summary at the end, e.g.  
-  ```
-  [*] The following 2 items failed to download:
+3. split_csv.py
 
-    CSV line 3: http://example.com/badfile.pdf
-    CSV line 10: http://another.com/badimage.jpg
-  ```
-- **Filename** includes the NAID if available, e.g. `720246_filename.pdf`.
+Takes any CSV and splits it into N parts (default=3). Each part has the same header row. Usage:
 
-### 3. `split_csv.py`
+python split_csv.py --input big.csv --parts 4
 
-Takes a CSV (e.g., produced by `nara_get_metadata.py`) and **splits** it into **N** parts of roughly equal size. Each split includes the **same header** row as the original.
-
-**Usage**:
-```bash
-python split_csv.py --input my_records.csv --parts 4
-```
-- `--input`: The input CSV to split.  
-- `--parts`: Number of output CSV files (default=3).  
-
-Produces something like:
-```
-records_part1.csv
-records_part2.csv
-records_part3.csv
-records_part4.csv
-```
-Each file has the same header and a share of the data rows.
-
----
-
-## Usage Examples
-
-### 1. Get Metadata by NAID
-
-```bash
-export NARA_API_KEY="YOUR_VALID_API_KEY"
-
-# Multiple NAIDs from command line
-python nara_get_metadata.py \
-  --naid 720246 123456 \
-  --limit 50 \
-  --outdir metadata_results
-
-# Or from a batch file
-python nara_get_metadata.py \
-  --batch naids.txt \
-  --outdir metadata_results
-```
-Creates subdirectories:
-```
-metadata_results/
-  ├─ 720246/
-  │   ├─ 720246-metadata-pg1of4-20250101.json
-  │   └─ 720246-binaries-20250101.csv
-  └─ 123456/
-      ├─ 123456-metadata-pg1of6-20250101.json
-      └─ 123456-binaries-20250101.csv
-```
-
-### 2. Download Files from the Resulting CSV
-
-```bash
-python nara_download_binaries.py \
-  --csv metadata_results/720246/720246-binaries-20250101.csv \
-  --download_path my_downloads \
-  --backoff 1000
-```
-Waits 1 second between each file download and logs any failures by CSV line number.
-
-### 3. Split a Large CSV
-
-```bash
-python split_csv.py \
-  --input metadata_results/720246/720246-binaries-20250101.csv \
-  --parts 4
-```
 Produces:
-```
+
 records_part1.csv
 records_part2.csv
 records_part3.csv
 records_part4.csv
-```
-Each containing the same header row and a portion of the original data.
 
----
+Usage Examples
 
-## License
+    Get Metadata
 
-This project is provided “as is” under the terms of your chosen license. Feel free to adapt and extend for your use case. We make no guarantees about data completeness, correctness, or performance.  
+export NARA_API_KEY="YOUR_VALID_API_KEY"
+python nara_get_metadata.py --naid 720246 987654 --outdir meta_out
 
-For more details, refer to the [NARA NextGen Catalog API docs](https://catalog.archives.gov/api/v2/api-docs/) and abide by any relevant usage policies.
+    If 720246 has digital objects via search, they’re saved to meta_out/720246/.
+    If 987654 does not have any objects in search, the script tries parentNaId/987654. If that also yields none, it logs a warning message.
+
+Download Binaries
+
+python nara_download_binaries.py \
+    --csv meta_out/720246/720246-binaries-YYYYMMdd.csv \
+    --download_path ./downloads \
+    --backoff 1000
+
+Creates subfolder ./downloads/20250217-1 for the files, waiting 1 second between each download.
+
+Split a Large CSV
+
+    python split_csv.py \
+      --input meta_out/720246/720246-binaries-YYYYMMdd.csv \
+      --parts 3
+
+    Produces records_part1.csv, records_part2.csv, records_part3.csv.
+
+License
+
+This project is provided “as is” under the terms of your chosen license. Feel free to adapt and extend for your use case. We make no guarantees about data completeness, correctness, or performance.
+
+For more details, refer to the NARA NextGen Catalog API docs and abide by any relevant usage policies.

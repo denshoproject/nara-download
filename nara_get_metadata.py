@@ -4,47 +4,23 @@
 nara_get_metadata.py
 
 For each NAID specified (either by --naid <...> or via a text file --batch),
-makes paginated queries to /records/search?naId_is=<NAID>, one NAID at a time.
+makes paginated queries to /records/search?naId_is=<NAID>, collecting JSON pages
+and extracting digital objects. If no digital objects are found, it discards
+that metadata and tries /records/parentNaId/{parentNaid} as a fallback.
 
 1. For each NAID:
-   a) Fetches paginated results from /records/search?naId_is=<NAID>
-      (uses body.hits.total.value to determine total pages).
-   b) Creates a subdirectory within --outdir, named after the NAID.
-   c) Saves each page's JSON to "{NAID}-metadata-pg[page]of[totalPages]-YYYYMMdd.json"
-      in that NAID subdirectory.
-   d) Extracts each record's naId, title, and for each digitalObject, appends
-      rows with objectUrl, objectFileSize to a CSV named
-      "{NAID}-binaries-YYYYMMdd.csv" in that same subdirectory.
+   a) Query /records/search?naId_is=<NAID> (pages 1..N).
+   b) If digital objects are found, produce <NAID>-binaries-YYYYMMdd.csv
+      in outdir/NAID/.
+   c) If no objects are found, discard those JSON pages and query
+      /records/parentNaId/{NAID}?page=...&limit=...
+   d) If the fallback also yields no objects, print a warning message
+      and skip producing CSV or any saved pages for that NAID.
 
-Requirements:
+Requires:
   - NARA_API_KEY in the environment (e.g. export NARA_API_KEY=...).
-  - The /records/search endpoint must return JSON of the form:
-      {
-        "body": {
-          "hits": {
-            "total": { "value": <int> },
-            "hits": [
-              {
-                "_source": {
-                  "record": {
-                    "naId": ...,
-                    "title": ...,
-                    "digitalObjects": [
-                      {
-                        "objectUrl": "...",
-                        "objectFileSize": <int>,
-                        ...
-                      },
-                      ...
-                    ]
-                  }
-                }
-              },
-              ...
-            ]
-          }
-        }
-      }
+  - The endpoints must return JSON of the form with "body.hits.total.value"
+    and hits in "body.hits.hits" that lead to "record.digitalObjects" items.
 """
 
 import os
@@ -57,7 +33,7 @@ import datetime
 import requests
 import http.client
 import logging
-from requests.exceptions import JSONDecodeError
+from json.decoder import JSONDecodeError   # Using standard library's JSONDecodeError
 
 API_BASE_URL = "https://catalog.archives.gov/api/v2"
 
@@ -82,12 +58,137 @@ def safe_json_parse(response):
         raise
 
 
+def fetch_via_search(session, naid, limit):
+    """
+    Fetch record pages from /records/search?naId_is=<NAID>&limit=<limit>&page=<page>.
+    Return (all_hits, total_pages, raw_pages) where:
+      - all_hits is the combined array of hits from body.hits.hits
+      - total_pages is the number of pages
+      - raw_pages is a list of (page_number, parsed_json) for each retrieved page
+    """
+    all_hits = []
+    raw_pages = []
+    page = 1
+    search_url = f"{API_BASE_URL}/records/search"
+
+    # 1) Retrieve first page
+    params_first_page = [("naId_is", naid), ("limit", limit), ("page", page)]
+    resp = session.get(search_url, params=params_first_page)
+    resp.raise_for_status()
+    data = safe_json_parse(resp)
+
+    body = data.get("body", {})
+    hits_section = body.get("hits", {})
+    total_info = hits_section.get("total", {})
+    total_records = total_info.get("value", 0)
+    if total_records == 0:
+        return ([], 0, [])  # no records at all
+
+    hits_first_page = hits_section.get("hits", [])
+    total_pages = math.ceil(total_records / limit)
+
+    # Save (page=1) in raw_pages
+    raw_pages.append((1, data))
+    all_hits.extend(hits_first_page)
+
+    # 2) Retrieve subsequent pages
+    for pg in range(2, total_pages + 1):
+        params_this_page = [("naId_is", naid), ("limit", limit), ("page", pg)]
+        resp_pg = session.get(search_url, params=params_this_page)
+        resp_pg.raise_for_status()
+        data_pg = safe_json_parse(resp_pg)
+
+        body_pg = data_pg.get("body", {})
+        hits_pg_section = body_pg.get("hits", {})
+        hits_pg = hits_pg_section.get("hits", [])
+        all_hits.extend(hits_pg)
+        raw_pages.append((pg, data_pg))
+
+    return (all_hits, total_pages, raw_pages)
+
+
+def fetch_via_parentnaid(session, naid, limit):
+    """
+    Fallback: fetch record pages from /records/parentNaId/{naid}?limit=<limit>&page=<page>.
+    Return (all_hits, total_pages, raw_pages).
+    Same structure as fetch_via_search.
+    """
+    all_hits = []
+    raw_pages = []
+    page = 1
+
+    url = f"{API_BASE_URL}/records/parentNaId/{naid}"
+    # 1) Retrieve first page
+    params_first_page = {"limit": limit, "page": page}
+    resp = session.get(url, params=params_first_page)
+    resp.raise_for_status()
+    data = safe_json_parse(resp)
+
+    # According to docs, the structure might be data["data"] for child records
+    # but let's assume it includes "body.hits.hits" as well. If the official
+    # docs differ, adapt accordingly.
+    # We'll try a consistent approach: body->hits->hits
+    body = data.get("body", {})
+    hits_section = body.get("hits", {})
+    total_info = hits_section.get("total", {})
+    total_records = total_info.get("value", 0)
+    if total_records == 0:
+        return ([], 0, [])
+
+    hits_first_page = hits_section.get("hits", [])
+    total_pages = math.ceil(total_records / limit)
+
+    all_hits.extend(hits_first_page)
+    raw_pages.append((1, data))
+
+    # 2) Retrieve subsequent pages
+    for pg in range(2, total_pages + 1):
+        params_this_page = {"limit": limit, "page": pg}
+        resp_pg = session.get(url, params=params_this_page)
+        resp_pg.raise_for_status()
+        data_pg = safe_json_parse(resp_pg)
+
+        body_pg = data_pg.get("body", {})
+        hits_pg_section = body_pg.get("hits", {})
+        hits_pg = hits_pg_section.get("hits", [])
+        all_hits.extend(hits_pg)
+        raw_pages.append((pg, data_pg))
+
+    return (all_hits, total_pages, raw_pages)
+
+
+def extract_digital_objects(all_hits):
+    """
+    Parse the combined hits array, returning a list of dicts with:
+      naId, title, objectUrl, objectFileSize
+    """
+    extracted_rows = []
+
+    for hit in all_hits:
+        _source = hit.get("_source", {})
+        record = _source.get("record", {})
+
+        rec_naid = record.get("naId")
+        title = record.get("title", "")
+
+        digital_objects = record.get("digitalObjects", [])
+        for dobj in digital_objects:
+            row = {
+                "naId": rec_naid,
+                "title": title,
+                "objectUrl": dobj.get("objectUrl"),
+                "objectFileSize": dobj.get("objectFileSize")
+            }
+            extracted_rows.append(row)
+    return extracted_rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Download metadata by NAID(s). For each NAID, queries /records/search?naId_is=<NAID>, "
-            "paginates all results, saves JSON pages, and extracts object info to a separate CSV "
-            "under a dedicated subdirectory named after the NAID."
+            "Download full pages from /records/search?naId_is=<NAID> for each NAID. "
+            "If no digital objects found, fallback to /records/parentNaId/<NAID>. "
+            "Save JSON pages and produce CSV if we find digital objects."
         )
     )
     parser.add_argument(
@@ -169,10 +270,8 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d")
 
     # -------------------------------------------------------------------------
-    # For each NAID, do the entire pagination, saving JSON pages & writing CSV
+    # For each NAID, attempt search-based approach, fallback to parentNaId, etc.
     # -------------------------------------------------------------------------
-    search_url = f"{API_BASE_URL}/records/search"
-
     for naid in naid_list:
         print("=" * 60)
         print(f"[*] Processing NAID: {naid}")
@@ -181,108 +280,76 @@ def main():
         naid_dir = os.path.join(args.outdir, naid)
         os.makedirs(naid_dir, exist_ok=True)
 
-        # Step 1: Retrieve first page for this NAID
-        page = 1
-        params_first_page = [
-            ("naId_is", naid),
-            ("limit", limit),
-            ("page", page),
-        ]
-
+        # 1) Attempt /records/search?naId_is=<NAID>
+        print(f"[*] Attempting /records/search?naId_is={naid}")
         try:
-            resp = session.get(search_url, params=params_first_page)
-            resp.raise_for_status()
-            data = safe_json_parse(resp)
+            all_hits, total_pages, raw_pages = fetch_via_search(session, naid, limit)
         except Exception as e:
-            log_error(f"Failed to retrieve page=1 for naId_is={naid}: {e}")
-            continue  # proceed to the next NAID
+            log_error(f"Failed fetching via /records/search for naId_is={naid}: {e}")
+            continue  # skip this NAID entirely
 
-        body = data.get("body", {})
-        hits_section = body.get("hits", {})
-        total_info = hits_section.get("total", {})
-        total_records = total_info.get("value", 0)
+        # Extract digital objects
+        extracted_rows = extract_digital_objects(all_hits)
 
-        if total_records == 0:
-            print(f"[!] No records found (total=0) for naId_is={naid}. Skipping.")
-            continue
-
-        first_page_hits = hits_section.get("hits", [])
-        total_pages = math.ceil(total_records / limit)
-
-        # Save page 1 JSON inside that NAID subdir
-        page1_filename = f"{naid}-metadata-pg{page}of{total_pages}-{now_str}.json"
-        page1_path = os.path.join(naid_dir, page1_filename)
-        with open(page1_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        print(f"[+] Saved page=1 JSON -> {page1_path}")
-
-        all_hits = list(first_page_hits)
-
-        print(f"[*] total_records={total_records}, total_pages={total_pages}")
-
-        # Step 2: Retrieve subsequent pages
-        for pg in range(2, total_pages + 1):
-            print(f"[*] Fetching page={pg} of {total_pages} for naId_is={naid}...")
-
-            params_this_page = [
-                ("naId_is", naid),
-                ("limit", limit),
-                ("page", pg),
-            ]
-
+        if len(extracted_rows) == 0:
+            # 2) fallback to /records/parentNaId/<NAID>
+            print(f"[!] No digital objects found. Falling back to /records/parentNaId/{naid} ...")
             try:
-                resp_pg = session.get(search_url, params=params_this_page)
-                resp_pg.raise_for_status()
-                data_pg = safe_json_parse(resp_pg)
-            except Exception as e:
-                log_error(f"Failed to retrieve page={pg} for naId_is={naid}: {e}")
-                break
+                all_hits2, total_pages2, raw_pages2 = fetch_via_parentnaid(session, naid, limit)
+            except Exception as e2:
+                log_error(f"Failed fetching via /records/parentNaId for {naid}: {e2}")
+                continue  # skip
 
-            # Save the JSON
-            page_filename = f"{naid}-metadata-pg{pg}of{total_pages}-{now_str}.json"
-            page_filepath = os.path.join(naid_dir, page_filename)
-            with open(page_filepath, "w", encoding="utf-8") as f:
-                json.dump(data_pg, f, indent=2)
-            print(f"[+] Saved page={pg} JSON -> {page_filepath}")
+            extracted_rows2 = extract_digital_objects(all_hits2)
+            if len(extracted_rows2) == 0:
+                # No digital objects from fallback either
+                print(f"[!] WARNING: No child digital objects were returned for NAID={naid}.")
+                # We discard everything, do not produce CSV or JSON
+                # Possibly remove the naid_dir we created
+                # os.rmdir(naid_dir) # won't work if not empty
+                # We'll just leave the empty subdir behind, or remove if no files inside
+                # For cleanliness, let's try to remove if it's empty
+                if not os.listdir(naid_dir):
+                    os.rmdir(naid_dir)
+                continue
+            else:
+                # fallback found some objects, so discard the search approach
+                # and produce pages + CSV from fallback
+                all_hits = all_hits2
+                total_pages = total_pages2
+                extracted_rows = extracted_rows2
+                raw_pages = raw_pages2
+                print(f"[+] Found {len(extracted_rows)} digital objects via fallback.")
+                # We'll save the fallback pages to the subdir
+                #  like {naid}-parent-pg{...} etc. or same naming scheme
+                # for clarity we can do:
+                fallback_prefix = f"{naid}-parentNaId-pg"
+        else:
+            # We do have some objects from the search approach
+            fallback_prefix = f"{naid}-metadata-pg"
 
-            body_pg = data_pg.get("body", {})
-            hits_pg_section = body_pg.get("hits", {})
-            hits_pg = hits_pg_section.get("hits", [])
-            all_hits.extend(hits_pg)
+        # If we get here with some extracted_rows, let's store the pages and produce CSV
+        if len(extracted_rows) > 0:
+            # 3) Save pages
+            print(f"[+] Saving {len(raw_pages)} pages to {naid_dir} ...")
+            for (pgnum, json_data) in raw_pages:
+                # total_pages we already have
+                filename = f"{fallback_prefix}{pgnum}of{total_pages}-{now_str}.json"
+                filepath = os.path.join(naid_dir, filename)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(json_data, f, indent=2)
 
-        print(f"[+] Retrieved total of {len(all_hits)} hits for NAID={naid}.\n")
+            # 4) Write extracted CSV
+            csv_filename = f"{naid}-binaries-{now_str}.csv"
+            csv_path = os.path.join(naid_dir, csv_filename)
+            with open(csv_path, "w", encoding="utf-8", newline="") as csvfile:
+                fieldnames = ["naId", "title", "objectUrl", "objectFileSize"]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(extracted_rows)
 
-        # Step 3: Extract fields from each hit
-        extracted_rows = []
-        for hit in all_hits:
-            _source = hit.get("_source", {})
-            record = _source.get("record", {})
-
-            rec_naid = record.get("naId")
-            title = record.get("title", "")
-
-            digital_objects = record.get("digitalObjects", [])
-            for dobj in digital_objects:
-                row = {
-                    "naId": rec_naid,
-                    "title": title,
-                    "objectUrl": dobj.get("objectUrl"),
-                    "objectFileSize": dobj.get("objectFileSize")
-                }
-                extracted_rows.append(row)
-
-        # Step 4: Write extracted fields to a CSV for this NAID
-        csv_filename = f"{naid}-binaries-{now_str}.csv"
-        csv_path = os.path.join(naid_dir, csv_filename)
-
-        with open(csv_path, "w", encoding="utf-8", newline="") as csvfile:
-            fieldnames = ["naId", "title", "objectUrl", "objectFileSize"]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(extracted_rows)
-
-        print(f"[+] Wrote {len(extracted_rows)} lines to CSV -> {csv_path}")
-        print("[DONE]\n")
+            print(f"[+] Wrote {len(extracted_rows)} lines to CSV -> {csv_path}")
+            print("[DONE]\n")
 
 
 if __name__ == "__main__":
